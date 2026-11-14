@@ -3,6 +3,8 @@
 import os
 from contextlib import contextmanager
 import psycopg2
+from dotenv import load_dotenv
+load_dotenv()
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 EMBED_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))

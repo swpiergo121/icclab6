@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import glob
 import hashlib
 import io
@@ -11,8 +10,8 @@ from pypdf import PdfReader
 from db import get_conn, init_db
 from llm import embed_texts, vec_literal
 
-MAX_PAGES_FILE = 300
-MAX_PAGES_TOTAL = 900
+# Sin límite por archivo. Se conserva el límite total de 900 páginas.
+MAX_PAGES_TOTAL = int(os.getenv("MAX_PAGES_TOTAL", "900"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 
@@ -68,43 +67,51 @@ def ingest_pdf(filename, raw):
         if row:
             return _result_from_db(cur, row[0], filename, "ya_indexado")
 
-    errors = []
+    # 1. Abrir el PDF y descifrarlo si tiene contraseña vacía
     try:
         reader = PdfReader(io.BytesIO(raw))
         if reader.is_encrypted:
-            reader.decrypt("")
+            # decrypt() devuelve 0 si no pudo descifrar, sin lanzar excepción
+            if not reader.decrypt(""):
+                return _result(filename, "error_lectura",
+                               errores=["PDF protegido con contraseña; no se puede leer"])
         total = len(reader.pages)
     except Exception as exc:
-        return _result(filename, "error_lectura", errores=[str(exc)])
+        return _result(filename, "error_lectura",
+                       errores=[f"{type(exc).__name__}: {exc}"])
 
-    if total > MAX_PAGES_FILE:
-        return _result(filename, "rechazado_mas_de_300_paginas", paginas=total)
-
+    # 2. Límite total de páginas (sin límite por archivo)
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT COALESCE(SUM(page_count), 0) FROM documents")
         used = cur.fetchone()[0]
     if used + total > MAX_PAGES_TOTAL:
-        return _result(filename, "rechazado_limite_900_paginas", paginas=total)
+        return _result(filename, "rechazado_limite_total", paginas=total,
+                       errores=[f"Se superaría el límite de {MAX_PAGES_TOTAL} páginas "
+                                f"(ya hay {used})"])
 
-    pages, empty = [], []
+    # 3. Extraer texto página por página
+    pages, empty, errors = [], [], []
     for num, page in enumerate(reader.pages, start=1):
         try:
             text = " ".join((page.extract_text() or "").split())
         except Exception as exc:
             text = ""
-            errors.append(f"página {num}: {exc}")
+            errors.append(f"página {num}: {type(exc).__name__}: {exc}")
         if not text:
             empty.append(num)
         pages.append((num, text))
 
+    # 4. Dividir en fragmentos (cada fragmento pertenece a una sola página)
     pieces = [(num, i, c) for num, text in pages for i, c in enumerate(chunk_text(text))]
 
+    # 5. Embeddings
     try:
         vectors = embed_texts([p[2] for p in pieces]) if pieces else []
     except Exception as exc:
         return _result(filename, "error_embeddings", paginas=total,
-                       sin_texto=empty, errores=[str(exc)])
+                       sin_texto=empty, errores=[f"{type(exc).__name__}: {exc}"])
 
+    # 6. Persistir
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO documents (filename, sha256, page_count) VALUES (%s, %s, %s) "
@@ -121,19 +128,27 @@ def ingest_pdf(filename, raw):
             "INSERT INTO pages (document_id, page_number, has_text, text) VALUES %s",
             [(doc_id, num, bool(t), t) for num, t in pages],
         )
-        execute_values(
-            cur,
-            "INSERT INTO chunks (document_id, page_number, chunk_index, content, embedding) VALUES %s",
-            [(doc_id, num, i, c, vec_literal(v)) for (num, i, c), v in zip(pieces, vectors)],
-            template="(%s, %s, %s, %s, %s::vector)",
-        )
+        if pieces:
+            execute_values(
+                cur,
+                "INSERT INTO chunks (document_id, page_number, chunk_index, content, embedding) VALUES %s",
+                [(doc_id, num, i, c, vec_literal(v)) for (num, i, c), v in zip(pieces, vectors)],
+                template="(%s, %s, %s, %s, %s::vector)",
+            )
 
     return _result(filename, "procesado", total, len(pieces), empty, errors)
 
 
 def ingest_folder(folder):
+    if not os.path.isdir(folder):
+        return [_result(folder, "error_carpeta",
+                        errores=[f"La carpeta '{folder}' no existe. Revisa PDF_DIR en .env"])]
+    paths = sorted(glob.glob(os.path.join(folder, "*.pdf")))
+    if not paths:
+        return [_result(folder, "sin_archivos",
+                        errores=[f"No hay archivos .pdf en '{folder}'"])]
     results = []
-    for path in sorted(glob.glob(os.path.join(folder, "*.pdf"))):
+    for path in paths:
         with open(path, "rb") as f:
             results.append(ingest_pdf(os.path.basename(path), f.read()))
     return results

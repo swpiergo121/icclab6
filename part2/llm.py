@@ -2,6 +2,8 @@
 
 import os
 from openai import OpenAI
+from dotenv import load_dotenv
+load_dotenv()
 
 EMBED_PROVIDER = os.getenv("EMBED_PROVIDER", "openai")
 EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
